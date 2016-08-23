@@ -6,28 +6,19 @@ import (
 
 	"github.com/Masterminds/glide/cache"
 	"github.com/Masterminds/glide/cfg"
-	"github.com/Masterminds/glide/dependency"
-	"github.com/Masterminds/glide/godep"
 	"github.com/Masterminds/glide/msg"
 	gpath "github.com/Masterminds/glide/path"
 	"github.com/Masterminds/glide/repo"
 )
 
 // Update updates repos and the lock file from the main glide yaml.
-func Update(installer *repo.Installer, skipRecursive, strip, stripVendor bool) {
-	if installer.UseCache {
-		cache.SystemLock()
-	}
+func Update(installer *repo.Installer, skipRecursive, stripVendor bool) {
+	cache.SystemLock()
 
 	base := "."
 	EnsureGopath()
 	EnsureVendorDir()
 	conf := EnsureConfig()
-
-	// Delete unused packages
-	if installer.DeleteUnused {
-		dependency.DeleteUnused(conf)
-	}
 
 	// Try to check out the initial dependencies.
 	if err := installer.Checkout(conf); err != nil {
@@ -59,12 +50,10 @@ func Update(installer *repo.Installer, skipRecursive, strip, stripVendor bool) {
 			msg.Err("Failed to set references: %s (Skip to cleanup)", err)
 		}
 	}
-	// Vendored cleanup
-	// VendoredCleanup. This should ONLY be run if UpdateVendored was specified.
-	// When stripping VCS happens this will happen as well. No need for double
-	// effort.
-	if installer.UpdateVendored && !strip {
-		repo.VendoredCleanup(confcopy)
+
+	err := installer.Export(confcopy)
+	if err != nil {
+		msg.Die("Unable to export dependencies to vendor directory: %s", err)
 	}
 
 	// Write glide.yaml (Why? Godeps/GPM/GB?)
@@ -76,17 +65,16 @@ func Update(installer *repo.Installer, skipRecursive, strip, stripVendor bool) {
 	// from the project. A removed dependency should warn and an added dependency
 	// should be added to the glide.yaml file. See issue #193.
 
-	if stripVendor {
-		confcopy = godep.RemoveGodepSubpackages(confcopy)
-	}
-
 	if !skipRecursive {
 		// Write lock
 		hash, err := conf.Hash()
 		if err != nil {
 			msg.Die("Failed to generate config hash. Unable to generate lock file.")
 		}
-		lock := cfg.NewLockfile(confcopy.Imports, confcopy.DevImports, hash)
+		lock, err := cfg.NewLockfile(confcopy.Imports, confcopy.DevImports, hash)
+		if err != nil {
+			msg.Die("Failed to generate lock file: %s", err)
+		}
 		wl := true
 		if gpath.HasLock(base) {
 			yml, err := ioutil.ReadFile(filepath.Join(base, gpath.LockFile))
@@ -113,14 +101,6 @@ func Update(installer *repo.Installer, skipRecursive, strip, stripVendor bool) {
 		msg.Info("Project relies on %d dependencies.", len(confcopy.Imports))
 	} else {
 		msg.Warn("Skipping lockfile generation because full dependency tree is not being calculated")
-	}
-
-	if strip {
-		msg.Info("Removing version control data from vendor directory...")
-		err := gpath.StripVcs()
-		if err != nil {
-			msg.Err("Unable to strip version control data: %s", err)
-		}
 	}
 
 	if stripVendor {

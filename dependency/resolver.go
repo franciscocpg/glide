@@ -2,7 +2,9 @@ package dependency
 
 import (
 	"container/list"
+	"errors"
 	"runtime"
+	"sort"
 	//"go/build"
 	"os"
 	"path/filepath"
@@ -51,6 +53,10 @@ type MissingPackageHandler interface {
 	//
 	// This can be used update a project found in the vendor/ folder.
 	InVendor(pkg string, addTest bool) error
+
+	// PkgPath is called to find the location locally to scan. This gives the
+	// handler to do things such as use a cached location.
+	PkgPath(pkg string) string
 }
 
 // DefaultMissingPackageHandler is the default handler for missing packages.
@@ -60,6 +66,7 @@ type MissingPackageHandler interface {
 type DefaultMissingPackageHandler struct {
 	Missing []string
 	Gopath  []string
+	Prefix  string
 }
 
 // NotFound prints a warning and then stores the package name in Missing.
@@ -82,6 +89,14 @@ func (d *DefaultMissingPackageHandler) OnGopath(pkg string, addTest bool) (bool,
 func (d *DefaultMissingPackageHandler) InVendor(pkg string, addTest bool) error {
 	msg.Info("Package %s found in vendor/ folder", pkg)
 	return nil
+}
+
+// PkgPath returns the path to the package
+func (d *DefaultMissingPackageHandler) PkgPath(pkg string) string {
+	if d.Prefix != "" {
+		return filepath.Join(d.Prefix, pkg)
+	}
+	return pkg
 }
 
 // VersionHandler sets the version for a package when found while scanning.
@@ -290,7 +305,7 @@ func (r *Resolver) ResolveLocal(deep bool) ([]string, []string, error) {
 			}
 		} else {
 			imps = p.Imports
-			testImps = p.TestImports
+			testImps = dedupeStrings(p.TestImports, p.XTestImports)
 		}
 
 		// We are only looking for dependencies in vendor. No root, cgo, etc.
@@ -470,7 +485,7 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 		// Here, we want to import the package and see what imports it has.
 		msg.Debug("Trying to open %s", vdep)
 		var imps []string
-		pkg, err := r.BuildContext.ImportDir(vdep, 0)
+		pkg, err := r.BuildContext.ImportDir(r.Handler.PkgPath(dep), 0)
 		if err != nil && strings.HasPrefix(err.Error(), "found packages ") {
 			// If we got here it's because a package and multiple packages
 			// declared. This is often because of an example with a package
@@ -478,9 +493,9 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 			// try to brute force the packages with a slower scan.
 			msg.Debug("Using Iterative Scanning for %s", dep)
 			if testDeps {
-				_, imps, err = IterativeScan(vdep)
+				_, imps, err = IterativeScan(r.Handler.PkgPath(dep))
 			} else {
-				imps, _, err = IterativeScan(vdep)
+				imps, _, err = IterativeScan(r.Handler.PkgPath(dep))
 			}
 
 			if err != nil {
@@ -488,8 +503,9 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 				continue
 			}
 		} else if err != nil {
-			msg.Debug("ImportDir error on %s: %s", vdep, err)
-			if strings.HasPrefix(err.Error(), "no buildable Go source") {
+			errStr := err.Error()
+			msg.Debug("ImportDir error on %s: %s", r.Handler.PkgPath(dep), err)
+			if strings.HasPrefix(errStr, "no buildable Go source") {
 				msg.Debug("No subpackages declared. Skipping %s.", dep)
 				continue
 			} else if os.IsNotExist(err) && !foundErr && !foundQ {
@@ -516,6 +532,16 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 					// see if this is on GOPATH and copy it?
 					msg.Info("Not found in vendor/: %s (1)", dep)
 				}
+			} else if strings.Contains(errStr, "no such file or directory") {
+				r.hadError[dep] = true
+				msg.Err("Error scanning %s: %s", dep, err)
+				msg.Err("This error means the referenced package was not found.")
+				msg.Err("Missing file or directory errors usually occur when multiple packages")
+				msg.Err("share a common dependency and the first reference encountered by the scanner")
+				msg.Err("sets the version to one that does not contain a subpackage needed required")
+				msg.Err("by another package that uses the shared dependency. Try setting a")
+				msg.Err("version in your glide.yaml that works for all packages that share this")
+				msg.Err("dependency.")
 			} else {
 				r.hadError[dep] = true
 				msg.Err("Error scanning %s: %s", dep, err)
@@ -523,7 +549,7 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 			continue
 		} else {
 			if testDeps {
-				imps = pkg.TestImports
+				imps = dedupeStrings(pkg.TestImports, pkg.XTestImports)
 			} else {
 				imps = pkg.Imports
 			}
@@ -562,10 +588,10 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 					r.VersionHandler.SetVersion(imp, addTest)
 				} else if err != nil {
 					r.hadError[dep] = true
-					msg.Warn("Error looking for %s: %s", imp, err)
+					msg.Err("Error looking for %s: %s", imp, err)
 				} else {
 					r.hadError[dep] = true
-					msg.Info("Not found: %s (2)", imp)
+					msg.Err("Not found: %s (2)", imp)
 				}
 			case LocGopath:
 				msg.Debug("Found on GOPATH, not vendor: %s", imp)
@@ -580,6 +606,11 @@ func (r *Resolver) resolveImports(queue *list.List, testDeps, addTest bool) ([]s
 			}
 		}
 
+	}
+
+	if len(r.hadError) > 0 {
+		// Errors occurred so we return.
+		return []string{}, errors.New("Error resolving imports")
 	}
 
 	// FIXME: From here to the end is a straight copy of the resolveList() func.
@@ -767,16 +798,16 @@ func (r *Resolver) imports(pkg string, testDeps, addTest bool) ([]string, error)
 	// FIXME: On error this should try to NotFound to the dependency, and then import
 	// it again.
 	var imps []string
-	p, err := r.BuildContext.ImportDir(pkg, 0)
+	p, err := r.BuildContext.ImportDir(r.Handler.PkgPath(pkg), 0)
 	if err != nil && strings.HasPrefix(err.Error(), "found packages ") {
 		// If we got here it's because a package and multiple packages
 		// declared. This is often because of an example with a package
 		// or main but +build ignore as a build tag. In that case we
 		// try to brute force the packages with a slower scan.
 		if testDeps {
-			_, imps, err = IterativeScan(pkg)
+			_, imps, err = IterativeScan(r.Handler.PkgPath(pkg))
 		} else {
-			imps, _, err = IterativeScan(pkg)
+			imps, _, err = IterativeScan(r.Handler.PkgPath(pkg))
 		}
 
 		if err != nil {
@@ -786,7 +817,7 @@ func (r *Resolver) imports(pkg string, testDeps, addTest bool) ([]string, error)
 		return []string{}, err
 	} else {
 		if testDeps {
-			imps = p.TestImports
+			imps = dedupeStrings(p.TestImports, p.XTestImports)
 		} else {
 			imps = p.Imports
 		}
@@ -1064,4 +1095,30 @@ func checkForBasedirSymlink(basedir string) (string, error) {
 	}
 
 	return basedir, nil
+}
+
+// helper func to merge, dedupe, and sort strings
+func dedupeStrings(s1, s2 []string) (r []string) {
+	dedupe := make(map[string]bool)
+
+	if len(s1) > 0 && len(s2) > 0 {
+		for _, i := range s1 {
+			dedupe[i] = true
+		}
+		for _, i := range s2 {
+			dedupe[i] = true
+		}
+
+		for i := range dedupe {
+			r = append(r, i)
+		}
+		// And then re-sort them
+		sort.Strings(r)
+	} else if len(s1) > 0 {
+		r = s1
+	} else if len(s2) > 0 {
+		r = s2
+	}
+
+	return
 }
